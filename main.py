@@ -3,6 +3,7 @@ import sys
 import io
 import shutil
 import numpy as np
+import pickle
 from PIL import Image
 from sklearn.cluster import AgglomerativeClustering
 from scipy.spatial.distance import pdist, squareform
@@ -20,7 +21,7 @@ INPUT_FOLDER = r"C:\Users\BIT PATNA\Desktop\AI_Photo_Organizer\input_photos"
 OUTPUT_FOLDER = r"C:\Users\BIT PATNA\Desktop\AI_Photo_Organizer\organized_photos"
 
 # AI Models - Best accuracy ke liye
-DETECTOR = "retinaface"       # Face dhundhne ke liye (sabse accurate)
+DETECTOR = "mtcnn"       # Face dhundhne ke liye (MTCNN gives fewer false positives than retinaface)
 EMBEDDING_MODEL = "Facenet512" # Face ka code (embedding) banane ke liye
 
 # Face confidence threshold - isse kam confidence wale faces ignore honge
@@ -48,16 +49,45 @@ def scan_photos(folder_path):
 def extract_faces_and_embeddings(folder_path, photos):
     """
     Har photo se faces nikalo aur unka embedding (mathematical code) banao.
-    
-    Ye function 2 cheezein return karta hai:
-    - face_data: List of dicts jisme har face ka embedding aur photo name hai
-    - no_face_photos: Wo photos jinme koi chehra nahi mila
+    Sath hi Database (cache) ka use karo taaki speed 10x ho jaye.
     """
     face_data = []
     no_face_photos = []
-
+    
+    # --------------------------------------------------------
+    # DATABASE CHECK & LOAD
+    # --------------------------------------------------------
+    db_folder = os.path.join(os.path.dirname(folder_path), "database")
+    db_file = os.path.join(db_folder, "embeddings_cache.pkl")
+    os.makedirs(db_folder, exist_ok=True)
+    
+    cache = {}
+    if os.path.exists(db_file):
+        try:
+            with open(db_file, "rb") as f:
+                cache = pickle.load(f)
+            print(f"   [Database] Loaded {len(cache)} scanned photos from memory! 🚀")
+        except Exception as e:
+            print(f"   [Database] Cache load failed, starting fresh. Error: {e}")
+            cache = {}
+            
+    new_data_added = False
+    
     for i, photo in enumerate(photos):
         photo_path = os.path.join(folder_path, photo)
+        
+        # 1. Check if photo is already in database memory
+        if photo in cache:
+            cached_info = cache[photo]
+            if cached_info == "no_face":
+                no_face_photos.append(photo)
+                print(f"[{i+1}/{len(photos)}] Skipping: {photo} (Cached: No face ⏩)")
+            else:
+                face_data.extend(cached_info)
+                print(f"[{i+1}/{len(photos)}] Skipping: {photo} (Cached: {len(cached_info)} faces ⏩)")
+            continue
+            
+        # 2. If not in memory, scan it fresh!
         print(f"[{i+1}/{len(photos)}] Scanning: {photo}...", end=" ", flush=True)
 
         try:
@@ -70,7 +100,6 @@ def extract_faces_and_embeddings(folder_path, photos):
             )
 
             # Sirf confident AUR bade faces rakhna
-            # Chote faces (background crowd) ko filter kar dena
             valid_faces = []
             for e in embeddings:
                 confidence = e.get("face_confidence", 0)
@@ -78,28 +107,48 @@ def extract_faces_and_embeddings(folder_path, photos):
                 face_w = face_area.get("w", 0)
                 face_h = face_area.get("h", 0)
                 
-                # Face tabhi valid hai jab:
-                # 1. Confidence 90% se zyada ho
-                # 2. Face ka size minimum 80x80 pixels ho
+                # Face tabhi valid hai jab confidence high ho aur size bada ho
                 if confidence > MIN_CONFIDENCE and face_w >= MIN_FACE_SIZE and face_h >= MIN_FACE_SIZE:
                     valid_faces.append(e)
 
             if not valid_faces:
                 print("No face")
                 no_face_photos.append(photo)
+                cache[photo] = "no_face"  # Save to memory
             else:
-                print(f"{len(valid_faces)} face(s) found!")
+                print(f"{len(valid_faces)} face(s) found! ✅")
+                photo_face_data = []
                 for j, face in enumerate(valid_faces):
-                    face_data.append({
+                    data = {
                         "photo": photo,
                         "embedding": face["embedding"],
                         "facial_area": face.get("facial_area", {}),
                         "face_index": j
-                    })
+                    }
+                    face_data.append(data)
+                    photo_face_data.append(data)
+                    
+                cache[photo] = photo_face_data # Save to memory
+                
+            new_data_added = True
 
         except Exception as e:
             print(f"Error: {e}")
             no_face_photos.append(photo)
+            cache[photo] = "no_face"
+            new_data_added = True
+
+    # --------------------------------------------------------
+    # SAVE TO DATABASE
+    # --------------------------------------------------------
+    if new_data_added:
+        print("\n   [Database] Saving new scans to memory...")
+        try:
+            with open(db_file, "wb") as f:
+                pickle.dump(cache, f)
+            print("   [Database] Memory updated successfully! 💾")
+        except Exception as e:
+            print(f"   [Database] Failed to save memory: {e}")
 
     return face_data, no_face_photos
 
@@ -132,13 +181,11 @@ def cluster_faces(face_data):
     cosine_distances = squareform(pdist(embeddings_normalized, metric="cosine"))
 
     # Agglomerative Clustering with Average Linkage:
-    # - distance_threshold = 0.55
+    # - distance_threshold = 0.35 (Facenet512 ke liye strict threshold, taaki mix na ho)
     # - linkage = "average" matlab group me AVERAGE distance check hoga
-    #   Complete linkage bahut strict tha (same person split ho raha tha)
-    #   Average linkage balanced hai — na zyada strict, na zyada loose
     clustering = AgglomerativeClustering(
         n_clusters=None,
-        distance_threshold=0.55,
+        distance_threshold=0.35,
         metric="precomputed",
         linkage="average"
     ).fit(cosine_distances)
