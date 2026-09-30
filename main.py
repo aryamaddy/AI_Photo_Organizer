@@ -39,10 +39,10 @@ logger.addHandler(ch)
 # ============================================================
 # CONSTANTS & CONFIGURATION
 # ============================================================
-DETECTOR: str = "mtcnn"       # Face detector (Less false positives)
+DETECTOR: str = "retinaface"       # Fast detector (Reverted for speed)
 EMBEDDING_MODEL: str = "Facenet512" # Face embedding model
-MIN_CONFIDENCE: float = 0.95
-MIN_FACE_SIZE: int = 250
+MIN_CONFIDENCE: float = 0.99       # Extremely strict to avoid clothes/arms
+MIN_FACE_SIZE: int = 300           # Only clear visible faces
 
 
 def scan_photos(folder_path: Path) -> List[Path]:
