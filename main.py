@@ -2,125 +2,132 @@ import os
 import sys
 import io
 import shutil
-import numpy as np
 import pickle
+import logging
+import argparse
+from pathlib import Path
+from typing import List, Dict, Tuple, Set, Any
+
+import numpy as np
 from PIL import Image
 from sklearn.cluster import AgglomerativeClustering
 from scipy.spatial.distance import pdist, squareform
 
-# Windows terminal me emojis ke liye UTF-8 encoding
+# Windows terminal encoding
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 from deepface import DeepFace
 
 # ============================================================
-# SETTINGS - Yahan se aap apne paths change kar sakte hain
+# LOGGING SETUP
 # ============================================================
-INPUT_FOLDER = r"C:\Users\BIT PATNA\Desktop\AI_Photo_Organizer\input_photos"
-OUTPUT_FOLDER = r"C:\Users\BIT PATNA\Desktop\AI_Photo_Organizer\organized_photos"
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-# AI Models - Best accuracy ke liye
-DETECTOR = "mtcnn"       # Face dhundhne ke liye (MTCNN gives fewer false positives than retinaface)
-EMBEDDING_MODEL = "Facenet512" # Face ka code (embedding) banane ke liye
+# File handler
+fh = logging.FileHandler('organizer.log', encoding='utf-8')
+fh.setFormatter(formatter)
+logger.addHandler(fh)
 
-# Face confidence threshold - isse kam confidence wale faces ignore honge
-MIN_CONFIDENCE = 0.95
-
-# Minimum face size (pixels) - isse chota chehra ignore hoga
-# Group photos me background ke chote chehre filter ho jayenge
-MIN_FACE_SIZE = 250
-
+# Console handler
+ch = logging.StreamHandler(sys.stdout)
+ch.setFormatter(formatter)
+logger.addHandler(ch)
 
 # ============================================================
-# STEP 1: Photos Dhundho
+# CONSTANTS & CONFIGURATION
 # ============================================================
-def scan_photos(folder_path):
+DETECTOR: str = "mtcnn"       # Face detector (Less false positives)
+EMBEDDING_MODEL: str = "Facenet512" # Face embedding model
+MIN_CONFIDENCE: float = 0.95
+MIN_FACE_SIZE: int = 250
+
+
+def scan_photos(folder_path: Path) -> List[Path]:
     """Folder me se saari photo files dhundho"""
-    valid_extensions = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
-    all_files = os.listdir(folder_path)
-    photos = [f for f in all_files if f.lower().endswith(valid_extensions)]
+    valid_extensions = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+    photos = []
+    for file in folder_path.iterdir():
+        if file.is_file() and file.suffix.lower() in valid_extensions:
+            photos.append(file)
     return sorted(photos)
 
 
-# ============================================================
-# STEP 2: Har Photo Me Faces Dhundho Aur Embedding Banao
-# ============================================================
-def extract_faces_and_embeddings(folder_path, photos):
+def extract_faces_and_embeddings(folder_path: Path, photos: List[Path]) -> Tuple[List[Dict[str, Any]], List[Path]]:
     """
-    Har photo se faces nikalo aur unka embedding (mathematical code) banao.
-    Sath hi Database (cache) ka use karo taaki speed 10x ho jaye.
+    Har photo se faces nikalo aur unka embedding banao.
+    Cache me mtime (modified time) use kiya hai for robust invalidation.
     """
-    face_data = []
-    no_face_photos = []
+    face_data: List[Dict[str, Any]] = []
+    no_face_photos: List[Path] = []
     
-    # --------------------------------------------------------
-    # DATABASE CHECK & LOAD
-    # --------------------------------------------------------
-    db_folder = os.path.join(os.path.dirname(folder_path), "database")
-    db_file = os.path.join(db_folder, "embeddings_cache.pkl")
-    os.makedirs(db_folder, exist_ok=True)
+    db_folder = folder_path.parent / "database"
+    db_file = db_folder / "embeddings_cache.pkl"
+    db_folder.mkdir(exist_ok=True)
     
-    cache = {}
-    if os.path.exists(db_file):
+    cache: Dict[str, Dict[str, Any]] = {}
+    if db_file.exists():
         try:
             with open(db_file, "rb") as f:
                 cache = pickle.load(f)
-            print(f"   [Database] Loaded {len(cache)} scanned photos from memory! 🚀")
+            logger.info(f"[Database] Loaded {len(cache)} scanned photos from memory! 🚀")
         except Exception as e:
-            print(f"   [Database] Cache load failed, starting fresh. Error: {e}")
+            logger.warning(f"[Database] Cache load failed, starting fresh. Error: {e}")
             cache = {}
             
     new_data_added = False
     
-    for i, photo in enumerate(photos):
-        photo_path = os.path.join(folder_path, photo)
+    for i, photo_path in enumerate(photos):
+        photo_name = photo_path.name
         
-        # 1. Check if photo is already in database memory
-        if photo in cache:
-            cached_info = cache[photo]
+        try:
+            mtime = photo_path.stat().st_mtime
+        except Exception:
+            mtime = 0.0
+
+        # Check robust cache (mtime check)
+        if photo_name in cache and cache[photo_name].get("mtime") == mtime:
+            cached_info = cache[photo_name].get("faces")
             if cached_info == "no_face":
-                no_face_photos.append(photo)
-                print(f"[{i+1}/{len(photos)}] Skipping: {photo} (Cached: No face ⏩)")
+                no_face_photos.append(photo_path)
+                logger.info(f"[{i+1}/{len(photos)}] Skipping: {photo_name} (Cached: No face ⏩)")
             else:
                 face_data.extend(cached_info)
-                print(f"[{i+1}/{len(photos)}] Skipping: {photo} (Cached: {len(cached_info)} faces ⏩)")
+                logger.info(f"[{i+1}/{len(photos)}] Skipping: {photo_name} (Cached: {len(cached_info)} faces ⏩)")
             continue
             
-        # 2. If not in memory, scan it fresh!
-        print(f"[{i+1}/{len(photos)}] Scanning: {photo}...", end=" ", flush=True)
+        logger.info(f"[{i+1}/{len(photos)}] Scanning: {photo_name}...")
 
         try:
-            # DeepFace.represent ek hi baar me face detect + embedding dono karta hai
             embeddings = DeepFace.represent(
-                img_path=photo_path,
+                img_path=str(photo_path),
                 model_name=EMBEDDING_MODEL,
                 detector_backend=DETECTOR,
-                enforce_detection=False  # Agar face nahi mila toh crash mat karo
+                enforce_detection=False
             )
 
-            # Sirf confident AUR bade faces rakhna
             valid_faces = []
             for e in embeddings:
-                confidence = e.get("face_confidence", 0)
+                confidence = e.get("face_confidence", 0.0)
                 face_area = e.get("facial_area", {})
                 face_w = face_area.get("w", 0)
                 face_h = face_area.get("h", 0)
                 
-                # Face tabhi valid hai jab confidence high ho aur size bada ho
                 if confidence > MIN_CONFIDENCE and face_w >= MIN_FACE_SIZE and face_h >= MIN_FACE_SIZE:
                     valid_faces.append(e)
 
             if not valid_faces:
-                print("No face")
-                no_face_photos.append(photo)
-                cache[photo] = "no_face"  # Save to memory
+                logger.info(f"[{i+1}/{len(photos)}] {photo_name} - No valid face")
+                no_face_photos.append(photo_path)
+                cache[photo_name] = {"mtime": mtime, "faces": "no_face"}
             else:
-                print(f"{len(valid_faces)} face(s) found! ✅")
+                logger.info(f"[{i+1}/{len(photos)}] {photo_name} - {len(valid_faces)} face(s) found! ✅")
                 photo_face_data = []
                 for j, face in enumerate(valid_faces):
                     data = {
-                        "photo": photo,
+                        "photo": photo_path,
                         "embedding": face["embedding"],
                         "facial_area": face.get("facial_area", {}),
                         "face_index": j
@@ -128,61 +135,39 @@ def extract_faces_and_embeddings(folder_path, photos):
                     face_data.append(data)
                     photo_face_data.append(data)
                     
-                cache[photo] = photo_face_data # Save to memory
+                cache[photo_name] = {"mtime": mtime, "faces": photo_face_data}
                 
             new_data_added = True
 
         except Exception as e:
-            print(f"Error: {e}")
-            no_face_photos.append(photo)
-            cache[photo] = "no_face"
+            logger.error(f"Error scanning {photo_name}: {e}")
+            no_face_photos.append(photo_path)
+            cache[photo_name] = {"mtime": mtime, "faces": "no_face"}
             new_data_added = True
 
-    # --------------------------------------------------------
-    # SAVE TO DATABASE
-    # --------------------------------------------------------
     if new_data_added:
-        print("\n   [Database] Saving new scans to memory...")
+        logger.info("\n   [Database] Saving new scans to memory...")
         try:
             with open(db_file, "wb") as f:
                 pickle.dump(cache, f)
-            print("   [Database] Memory updated successfully! 💾")
+            logger.info("   [Database] Memory updated successfully! 💾")
         except Exception as e:
-            print(f"   [Database] Failed to save memory: {e}")
+            logger.error(f"   [Database] Failed to save memory: {e}")
 
     return face_data, no_face_photos
 
 
-# ============================================================
-# STEP 3: Similar Faces Ko Group Karo (Clustering)
-# ============================================================
-def cluster_faces(face_data):
-    """
-    Agglomerative Clustering (Complete Linkage) use karke similar faces ko group karo.
-    
-    DBSCAN se ye BEHTAR hai kyunki:
-    - Complete Linkage = group me tabhi daalega jab SAARE chehre match karein
-    - Chaining problem nahi hogi (A matches B, B matches C, but A != C)
-    - Google Photos bhi similar approach use karta hai
-    
-    Return: (person_photos dict, person_faces dict)
-    """
+def cluster_faces(face_data: List[Dict[str, Any]]) -> Tuple[Dict[str, Set[Path]], Dict[str, List[Dict[str, Any]]]]:
+    """Clustering using Cosine similarity. Limits mentioned in README regarding scalability."""
     if not face_data:
         return {}, {}
 
-    # Saare embeddings ko ek array me daalo
     embeddings = np.array([f["embedding"] for f in face_data])
-
-    # Embeddings ko normalize karo
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     embeddings_normalized = embeddings / norms
 
-    # Cosine distance matrix banao (har face ka har dusre face se distance)
     cosine_distances = squareform(pdist(embeddings_normalized, metric="cosine"))
 
-    # Agglomerative Clustering with Average Linkage:
-    # - distance_threshold = 0.35 (Facenet512 ke liye strict threshold, taaki mix na ho)
-    # - linkage = "average" matlab group me AVERAGE distance check hoga
     clustering = AgglomerativeClustering(
         n_clusters=None,
         distance_threshold=0.35,
@@ -192,9 +177,8 @@ def cluster_faces(face_data):
 
     labels = clustering.labels_
 
-    # Ab har person ke liye photos aur face info collect karo
-    person_photos = {}   # person_name -> set of photo names
-    person_faces = {}    # person_name -> list of face info (for preview)
+    person_photos: Dict[str, Set[Path]] = {}
+    person_faces: Dict[str, List[Dict[str, Any]]] = {}
 
     for i, label in enumerate(labels):
         person_name = f"Person_{label + 1}"
@@ -209,15 +193,12 @@ def cluster_faces(face_data):
             "facial_area": face_data[i]["facial_area"]
         })
 
-    # Sirf 1 photo wale groups ko "Unknown" me daal do
-    # (Agar kisi insaan ki sirf 1 photo hai toh wo identify nahi ho sakta)
-    final_photos = {}
-    final_faces = {}
-    unknown_photos = set()
-    unknown_face_list = []
+    final_photos: Dict[str, Set[Path]] = {}
+    final_faces: Dict[str, List[Dict[str, Any]]] = {}
+    unknown_photos: Set[Path] = set()
+    unknown_face_list: List[Dict[str, Any]] = []
     person_counter = 1
 
-    # Pehle groups ko size ke hisaab se sort karo (bade groups pehle)
     sorted_groups = sorted(person_photos.items(), key=lambda x: len(x[1]), reverse=True)
 
     for old_name, photos_set in sorted_groups:
@@ -237,149 +218,136 @@ def cluster_faces(face_data):
     return final_photos, final_faces
 
 
-# ============================================================
-# STEP 4: Photos Ko Person-Wise Folders Me COPY Karo
-# ============================================================
-def save_face_preview(input_folder, output_folder, person_name, face_info):
-    """
-    Person ka chehra crop karke ek preview image save karo.
-    Ye Google Photos jaisa face icon hai — taaki pata chale ki ye kaun hai.
-    """
+def save_face_preview(photo_path: Path, face_info: Dict[str, Any], output_path: Path) -> None:
     try:
-        # Pehle face ki info le lo
-        photo_name = face_info["photo"]
         area = face_info["facial_area"]
-        x = area.get("x", 0)
-        y = area.get("y", 0)
-        w = area.get("w", 100)
-        h = area.get("h", 100)
-
-        # Original photo open karo
-        photo_path = os.path.join(input_folder, photo_name)
+        x, y, w, h = area.get("x", 0), area.get("y", 0), area.get("w", 0), area.get("h", 0)
+        
         with Image.open(photo_path) as img:
-            # Thoda padding add karo taaki chehra acche se dikhe
-            padding = int(max(w, h) * 0.3)
-            left = max(0, x - padding)
-            top = max(0, y - padding)
-            right = min(img.width, x + w + padding)
-            bottom = min(img.height, y + h + padding)
-
-            # Chehra crop karo
-            face_crop = img.crop((left, top, right, bottom))
-
-            # 300x300 resize karo taaki sab previews ek size ke hon
-            face_crop = face_crop.resize((300, 300), Image.LANCZOS)
-
-            # Save karo
-            person_folder = os.path.join(output_folder, person_name)
-            preview_path = os.path.join(person_folder, "_face_preview.jpg")
-            face_crop.save(preview_path, "JPEG", quality=95)
-
+            padding_x = int(w * 0.2)
+            padding_y = int(h * 0.2)
+            
+            left = max(0, x - padding_x)
+            top = max(0, y - padding_y)
+            right = min(img.width, x + w + padding_x)
+            bottom = min(img.height, y + h + padding_y)
+            
+            face_img = img.crop((left, top, right, bottom))
+            face_img.thumbnail((300, 300))
+            face_img.save(output_path, "JPEG", quality=85)
+            
     except Exception as e:
-        print(f"   Preview error for {person_name}: {e}")
+        logger.error(f"Error saving face preview for {photo_path.name}: {e}")
 
 
-def organize_photos(input_folder, output_folder, person_photos, person_faces, no_face_photos):
-    """
-    Photos ko organized folders me COPY karo.
-    Har person folder me ek face preview bhi save hoga.
+def create_link_or_copy(src: Path, dst: Path) -> None:
+    """Uses hardlink to save disk space, falls back to copy2 if hardlink fails."""
+    try:
+        # Creating a hard link (Space efficient)
+        os.link(str(src), str(dst))
+    except Exception as e:
+        # Fallback to normal copy if hardlink fails (e.g., crossing drives)
+        logger.debug(f"Hardlink failed for {src.name} -> {dst.name} ({e}), falling back to copy2.")
+        shutil.copy2(src, dst)
+
+
+def organize_photos(input_folder: Path, output_folder: Path, 
+                    person_photos: Dict[str, Set[Path]], 
+                    person_faces: Dict[str, List[Dict[str, Any]]], 
+                    no_face_photos: List[Path]) -> int:
     
-    IMPORTANT: Original photos KABHI move ya delete nahi hongi!
-    Sirf copy hogi.
-    """
-    # Output folder banao (agar nahi hai toh)
-    os.makedirs(output_folder, exist_ok=True)
+    if output_folder.exists():
+        shutil.rmtree(output_folder, ignore_errors=True)
+    output_folder.mkdir(parents=True, exist_ok=True)
 
     total_copies = 0
 
-    # Har person ke liye folder banao aur photos copy karo
-    for person, photos in sorted(person_photos.items()):
-        person_folder = os.path.join(output_folder, person)
-        os.makedirs(person_folder, exist_ok=True)
+    for person, photos_set in person_photos.items():
+        person_folder = output_folder / person
+        person_folder.mkdir(exist_ok=True)
 
-        for photo in sorted(photos):
-            src = os.path.join(input_folder, photo)
-            dst = os.path.join(person_folder, photo)
-            shutil.copy2(src, dst)
+        if person in person_faces and len(person_faces[person]) > 0:
+            best_face = person_faces[person][0]
+            preview_path = person_folder / "_face_preview.jpg"
+            save_face_preview(best_face["photo"], best_face, preview_path)
+
+        for photo_path in photos_set:
+            dest_path = person_folder / photo_path.name
+            create_link_or_copy(photo_path, dest_path)
             total_copies += 1
+            
+        logger.info(f"   {person}: {len(photos_set)} photos processed + face preview saved")
 
-        # Face preview save karo (pehle face ka crop)
-        if person in person_faces and person_faces[person]:
-            save_face_preview(input_folder, output_folder, person, person_faces[person][0])
-
-        print(f"   {person}: {len(photos)} photos copied + face preview saved")
-
-    # Bina face wali photos ko "No_Faces" folder me daalo
     if no_face_photos:
-        no_face_folder = os.path.join(output_folder, "No_Faces")
-        os.makedirs(no_face_folder, exist_ok=True)
-
-        for photo in no_face_photos:
-            src = os.path.join(input_folder, photo)
-            dst = os.path.join(no_face_folder, photo)
-            shutil.copy2(src, dst)
+        no_face_folder = output_folder / "No_Faces"
+        no_face_folder.mkdir(exist_ok=True)
+        for photo_path in no_face_photos:
+            dest_path = no_face_folder / photo_path.name
+            create_link_or_copy(photo_path, dest_path)
             total_copies += 1
-
-        print(f"   No_Faces: {len(no_face_photos)} photos copied")
+        logger.info(f"   No_Faces: {len(no_face_photos)} photos processed")
 
     return total_copies
 
 
-# ============================================================
-# MAIN FUNCTION - Sab kuch yahan se start hota hai
-# ============================================================
-def main():
-    print("=" * 50)
-    print("   AI Photo Organizer")
-    print("   Google Photos-Style Face Grouping")
-    print("=" * 50)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="AI Photo Organizer - Group photos by faces locally.")
+    parser.add_argument("--input", type=str, default="input_photos", help="Path to input photos folder")
+    parser.add_argument("--output", type=str, default="organized_photos", help="Path to output photos folder")
+    args = parser.parse_args()
 
-    # Step 1: Photos dhundho
-    print("\nStep 1: Scanning photos...")
-    photos = scan_photos(INPUT_FOLDER)
-    print(f"   Found {len(photos)} photos.\n")
+    input_folder = Path(args.input).resolve()
+    output_folder = Path(args.output).resolve()
 
-    if not photos:
-        print("No photos found! Check your input folder.")
+    logger.info("==================================================")
+    logger.info("   AI Photo Organizer (Pro Version)")
+    logger.info("==================================================")
+
+    if not input_folder.exists():
+        logger.error(f"Input folder '{input_folder}' nahi mila. Folder create kijiye aur usme photos daaliye.")
         return
 
-    # Step 2: Faces dhundho aur embeddings banao
-    print("Step 2: Detecting faces & generating embeddings...")
-    print("   (Using RetinaFace + Facenet512 for best accuracy)")
-    print("   This may take a few minutes...\n")
+    logger.info("\nStep 1: Scanning photos...")
+    photos = scan_photos(input_folder)
+    
+    if not photos:
+        logger.warning(f"Koi photos nahi mili '{input_folder}' me.")
+        return
+        
+    logger.info(f"   Found {len(photos)} photos.")
 
-    face_data, no_face_photos = extract_faces_and_embeddings(INPUT_FOLDER, photos)
+    logger.info("\nStep 2: Detecting faces & generating embeddings...")
+    logger.info(f"   (Using {DETECTOR.upper()} + {EMBEDDING_MODEL} for best accuracy)")
+    
+    face_data, no_face_photos = extract_faces_and_embeddings(input_folder, photos)
 
-    print(f"\n   Summary:")
-    print(f"   Total faces detected: {len(face_data)}")
-    print(f"   Photos without faces: {len(no_face_photos)}")
+    logger.info(f"\n   Summary:")
+    logger.info(f"   Total faces detected: {len(face_data)}")
+    logger.info(f"   Photos without faces: {len(no_face_photos)}")
 
     if not face_data:
-        print("\n   No faces found in any photo. Nothing to organize.")
+        logger.info("\n   No faces found in any photo. Nothing to organize.")
         return
 
-    # Step 3: Similar faces ko group karo
-    print("\nStep 3: Grouping similar faces (AI clustering)...")
+    logger.info("\nStep 3: Grouping similar faces (AI clustering)...")
     person_photos, person_faces = cluster_faces(face_data)
 
     person_groups = [k for k in person_photos if k != "Unknown"]
-    print(f"   Found {len(person_groups)} person group(s)")
+    logger.info(f"   Found {len(person_groups)} person group(s)")
     for person, photos_set in sorted(person_photos.items()):
-        print(f"   - {person}: {len(photos_set)} photos")
+        logger.info(f"   - {person}: {len(photos_set)} photos")
 
-    # Step 4: Photos organize karo + face previews banao
-    print(f"\nStep 4: Copying photos + saving face previews...")
-    total = organize_photos(INPUT_FOLDER, OUTPUT_FOLDER, person_photos, person_faces, no_face_photos)
+    logger.info(f"\nStep 4: Creating hardlinks & saving face previews...")
+    total = organize_photos(input_folder, output_folder, person_photos, person_faces, no_face_photos)
 
-    print(f"\n   Done! {total} photo copies created.")
-    print(f"   Output folder: {OUTPUT_FOLDER}")
+    logger.info(f"\n   Done! {total} photo links/copies created.")
+    logger.info(f"   Output folder: {output_folder}")
 
-    print("\n" + "=" * 50)
-    print("   Photo Organization Complete!")
-    print("   Original photos are SAFE and UNTOUCHED.")
-    print("=" * 50)
+    logger.info("\n" + "=" * 50)
+    logger.info("   Photo Organization Complete!")
+    logger.info("   Original photos are SAFE and UNTOUCHED (using Hardlinks).")
+    logger.info("=" * 50)
 
 
-# Ye line ensure karti hai ki code tabhi chale jab directly run karein
 if __name__ == "__main__":
     main()
