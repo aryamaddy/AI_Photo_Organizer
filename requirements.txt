@@ -1,0 +1,7 @@
+deepface
+tf-keras
+scikit-learn
+scipy
+numpy
+Pillow
+python-dotenv

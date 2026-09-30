@@ -1,0 +1,29 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Input photos (user's personal photos - not for GitHub)
+input_photos/
+
+# Organized output (generated files)
+organized_photos/
+
+# DeepFace model cache
+.deepface/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test files
+test_face.py
